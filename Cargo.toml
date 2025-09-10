@@ -157,9 +157,9 @@ portable-atomic = { version = "1.11.1" }
 portable-atomic-util = { version = "0.2.4", features = ["alloc"] }
 
 ### For the main burn branch. ###
-cubecl = { git = "https://github.com/AdrianEddy/cubecl", default-features = false, rev = "28245d18815513fdf8f309c431bffb5314b91d2b" }
-cubecl-common = { git = "https://github.com/AdrianEddy/cubecl", default-features = false, rev = "28245d18815513fdf8f309c431bffb5314b91d2b" }
-cubecl-quant = { git = "https://github.com/AdrianEddy/cubecl", default-features = false, rev = "28245d18815513fdf8f309c431bffb5314b91d2b" }
+cubecl = { git = "https://github.com/AdrianEddy/cubecl", default-features = false, branch = "all_updates" }
+cubecl-common = { git = "https://github.com/AdrianEddy/cubecl", default-features = false, branch = "all_updates" }
+cubecl-quant = { git = "https://github.com/AdrianEddy/cubecl", default-features = false, branch = "all_updates" }
 ### For local development. ###
 # cubecl = { path = "../cubecl/crates/cubecl", default-features = false }
 # cubecl-common = { path = "../cubecl/crates/cubecl-common", default-features = false }
