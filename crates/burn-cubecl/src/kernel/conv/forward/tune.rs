@@ -2,7 +2,7 @@ use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::ops::ConvOptions;
 use cubecl::{
     ir::ElemType,
-    tune::{LocalTuner, Tunable, TunableSet, anchor, local_tuner},
+    tune::{LocalTuner, Tunable, TunableSet, TuneGroup, anchor, local_tuner},
 };
 use cubek::convolution::{AcceleratedTileKind, DepthwiseStrategy, DepthwiseTiling};
 
@@ -46,6 +46,28 @@ const DEPTHWISE_4X2_SCALAR: DepthwiseStrategy = DepthwiseStrategy::Fixed(Depthwi
     lines: 1,
 });
 
+/// The level every candidate is measured at.
+const PRIORITY_MAX: i8 = 1;
+/// The level measured only should every candidate above it decline the problem.
+const PRIORITY_FALLBACK: i8 = 0;
+
+/// `conv_direct`'s level: with the other candidates where the input's channels give them no
+/// vector loads, and a fallback under them everywhere else.
+///
+/// Where the channels line up, it is 8–90× slower than the best of them: every convolution of a
+/// ResNet-50 and an IResNet-100 past their stems, on an RTX 5090 and on a Ryzen 9950X's 2-CU
+/// Radeon alike. On the Radeon that is 1–2 s a sample for one convolution of a 1024² picture's
+/// first stage, and Windows resets a device whose dispatch runs for 2 s: tuning anything larger
+/// lost the device. Where they don't line up (an RGB stem), it can win: 118 ms against
+/// `simple_sync_cmma`'s 191 for a 7×7 stem on that Radeon. As a fallback, it still serves what
+/// the others decline: grouped weights, a device without tensor cores.
+fn direct_priority(key: &CubeAutotuneKey) -> i8 {
+    match key {
+        CubeAutotuneKey::Conv(key) if key.lhs_shape_align > 0 => PRIORITY_FALLBACK,
+        _ => PRIORITY_MAX,
+    }
+}
+
 /// Executes autotune on convolution operations
 pub fn conv_autotune<const N: usize>(
     input: CubeTensor,
@@ -59,11 +81,17 @@ pub fn conv_autotune<const N: usize>(
 
     let tune_id = CubeTuneId::new(&input.client, &input.device);
     let tunables = TUNER.init(&tune_id, || {
+        // One cutoff group holds every candidate, so that `conv_direct` can sit a level under
+        // the rest (`direct_priority`).
+        let conv = TuneGroup::<CubeAutotuneKey>::new("conv", |_| 0);
+        let every = |_: &CubeAutotuneKey| PRIORITY_MAX;
         TunableSet::new(create_key::<N>, create_conv_input::<N>)
-            .with(Tunable::new(
-                "conv_direct",
-                |(input, weight, bias, options)| conv_direct::<N>(input, weight, bias, options),
-            ))
+            .with(
+                Tunable::new("conv_direct", |(input, weight, bias, options)| {
+                    conv_direct::<N>(input, weight, bias, options)
+                })
+                .group(&conv, direct_priority),
+            )
             // Declines with `NotDepthwise` on anything that is not one filter per channel, so
             // each of these costs a dense shape nothing but the setup call that rejects it.
             //
@@ -72,76 +100,90 @@ pub fn conv_autotune<const N: usize>(
             // which one wins swings with the window's depth and the block's width in a way the
             // shape does not predict. The routine's own default is the fallback when no tuning
             // has run; these are what let a run that does tune land on the right one.
-            .with(Tunable::new(
-                "conv_depthwise",
-                |(input, weight, bias, options)| {
+            .with(
+                Tunable::new("conv_depthwise", |(input, weight, bias, options)| {
                     conv_depthwise::<N>(input, weight, bias, options, DepthwiseStrategy::Routine)
-                },
-            ))
-            .with(Tunable::new(
-                "conv_depthwise_8x4_lined",
-                |(input, weight, bias, options)| {
-                    conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_8X4_LINED)
-                },
-            ))
-            .with(Tunable::new(
-                "conv_depthwise_2x4_scalar",
-                |(input, weight, bias, options)| {
-                    conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_2X4_SCALAR)
-                },
-            ))
-            .with(Tunable::new(
-                "conv_depthwise_8x2_lined",
-                |(input, weight, bias, options)| {
-                    conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_8X2_LINED)
-                },
-            ))
-            .with(Tunable::new(
-                "conv_depthwise_4x2_scalar",
-                |(input, weight, bias, options)| {
-                    conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_4X2_SCALAR)
-                },
-            ))
-            .with(Tunable::new(
-                "conv_im2col_1x1",
-                |(input, weight, bias, options)| conv_im2col_1x1::<N>(input, weight, bias, options),
-            ))
-            .with(Tunable::new(
-                "simple_sync_cmma",
-                |(input, weight, bias, options)| {
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new(
+                    "conv_depthwise_8x4_lined",
+                    |(input, weight, bias, options)| {
+                        conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_8X4_LINED)
+                    },
+                )
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new(
+                    "conv_depthwise_2x4_scalar",
+                    |(input, weight, bias, options)| {
+                        conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_2X4_SCALAR)
+                    },
+                )
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new(
+                    "conv_depthwise_8x2_lined",
+                    |(input, weight, bias, options)| {
+                        conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_8X2_LINED)
+                    },
+                )
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new(
+                    "conv_depthwise_4x2_scalar",
+                    |(input, weight, bias, options)| {
+                        conv_depthwise::<N>(input, weight, bias, options, DEPTHWISE_4X2_SCALAR)
+                    },
+                )
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("conv_im2col_1x1", |(input, weight, bias, options)| {
+                    conv_im2col_1x1::<N>(input, weight, bias, options)
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("simple_sync_cmma", |(input, weight, bias, options)| {
                     conv_gemm_simple_sync(input, weight, bias, options, AcceleratedTileKind::Cmma)
-                },
-            ))
-            .with(Tunable::new(
-                "simple_sync_mma",
-                |(input, weight, bias, options)| {
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("simple_sync_mma", |(input, weight, bias, options)| {
                     conv_gemm_simple_sync(input, weight, bias, options, AcceleratedTileKind::Mma)
-                },
-            ))
-            .with(Tunable::new(
-                "simple_async_cmma",
-                |(input, weight, bias, options)| {
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("simple_async_cmma", |(input, weight, bias, options)| {
                     conv_gemm_simple_async(input, weight, bias, options, AcceleratedTileKind::Cmma)
-                },
-            ))
-            .with(Tunable::new(
-                "simple_async_mma",
-                |(input, weight, bias, options)| {
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("simple_async_mma", |(input, weight, bias, options)| {
                     conv_gemm_simple_async(input, weight, bias, options, AcceleratedTileKind::Mma)
-                },
-            ))
-            .with(Tunable::new(
-                "simple_tma_cmma",
-                |(input, weight, bias, options)| {
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("simple_tma_cmma", |(input, weight, bias, options)| {
                     conv_gemm_simple_tma(input, weight, bias, options, AcceleratedTileKind::Cmma)
-                },
-            ))
-            .with(Tunable::new(
-                "simple_tma_mma",
-                |(input, weight, bias, options)| {
+                })
+                .group(&conv, every),
+            )
+            .with(
+                Tunable::new("simple_tma_mma", |(input, weight, bias, options)| {
                     conv_gemm_simple_tma(input, weight, bias, options, AcceleratedTileKind::Mma)
-                },
-            ))
+                })
+                .group(&conv, every),
+            )
     });
 
     TUNER.execute(&tune_id, &client, tunables, (input, weight, bias, options))
